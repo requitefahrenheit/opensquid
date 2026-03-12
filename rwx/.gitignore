@@ -1,0 +1,4 @@
+*.log
+logs/
+audit.log
+env.sh
