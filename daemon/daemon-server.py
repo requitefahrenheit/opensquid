@@ -9,7 +9,8 @@ Run:  python3 daemon-server.py
 Port: 8254
 """
 
-import os, json, uuid, logging, asyncio, sqlite3, datetime, secrets
+import os, json, uuid, logging, asyncio, sqlite3, datetime, secrets, socket, subprocess
+import threading, time, urllib.request
 from pathlib import Path
 from typing import Optional
 
@@ -31,6 +32,8 @@ AUTH_TOKEN = os.environ.get("DAEMON_AUTH_TOKEN", "emc2ymmv")
 MAX_AGENT_STEPS = 20
 CLAUDE_MODEL = "claude-opus-4-20250514"
 
+SKILLS_DIR = os.path.expanduser("~/claude/opensquid/skills")
+
 # Upstream MCP endpoints
 CORTEX_URL = "https://autonomous.fahrenheitrequited.dev"
 OPENMIND_URL = "https://openmind.fahrenheitrequited.dev"
@@ -38,6 +41,229 @@ RWX_URL = "https://rwx.fahrenheitrequited.dev"
 
 log = logging.getLogger("daemon")
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(name)s] %(message)s")
+
+# ─── AgentCortexManager (inlined from agent_cortex.py) ───────────────────────
+
+_CORTEX_DIR = Path.home() / "cortex"
+_DUAL_SERVER = Path.home() / "claude" / "mcp-server" / "dual-server.py"
+_PYTHON = Path.home() / "miniconda3" / "bin" / "python3"
+_CORTEX_PORT_RANGE = range(8300, 8400)
+_CORTEX_HEALTH_TIMEOUT = 180.0  # seconds; ML model loading can take 2+ minutes
+
+
+def _is_port_free(port: int) -> bool:
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+        s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        try:
+            s.bind(("127.0.0.1", port))
+            return True
+        except OSError:
+            return False
+
+
+class AgentCortexManager:
+    """
+    Manages private Cortex instances for named agents.
+
+    Thread-safe. One global instance is shared across all sessions.
+    Ports are allocated from the range 8300-8399.
+    """
+
+    def __init__(self):
+        self._lock = threading.Lock()
+        self._running: dict = {}  # agent_id -> {port, pid, process, db_path, url}
+
+    def _find_free_port(self) -> int:
+        """Find a free port in 8300-8399."""
+        with self._lock:
+            used = {info["port"] for info in self._running.values()}
+        for port in _CORTEX_PORT_RANGE:
+            if port not in used and _is_port_free(port):
+                return port
+        raise RuntimeError("No free port available in range 8300-8399")
+
+    def _wait_healthy(self, port: int, timeout: float = _CORTEX_HEALTH_TIMEOUT) -> bool:
+        """Poll /api/stats until 200 OK or timeout."""
+        url = f"http://localhost:{port}/api/stats"
+        deadline = time.time() + timeout
+        while time.time() < deadline:
+            try:
+                with urllib.request.urlopen(url, timeout=2) as resp:
+                    if resp.status == 200:
+                        return True
+            except Exception:
+                pass
+            time.sleep(0.5)
+        return False
+
+    def provision(self, agent_id: str) -> dict:
+        """
+        Provision a private Cortex for agent_id.
+        Returns: {agent_id, db_path, port, url, pid}
+
+        If an instance is already running for this agent_id, returns it.
+        Otherwise: find free port, launch dual-server.py, wait for health check.
+        """
+        with self._lock:
+            if agent_id in self._running:
+                info = self._running[agent_id]
+                proc = info["process"]
+                if proc.poll() is None:
+                    # Still alive — return existing info
+                    return {k: v for k, v in info.items() if k != "process"}
+                else:
+                    # Process died; clean up and re-provision
+                    del self._running[agent_id]
+
+        # Find port and launch (outside lock to avoid blocking)
+        _CORTEX_DIR.mkdir(parents=True, exist_ok=True)
+        db_path = str(_CORTEX_DIR / f"agent-{agent_id}.db")
+        port = self._find_free_port()
+
+        env = os.environ.copy()
+        env["CORTEX_DB"] = db_path
+        env["CORTEX_PORT"] = str(port)
+
+        proc = subprocess.Popen(
+            [str(_PYTHON), str(_DUAL_SERVER)],
+            env=env,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+
+        log.info(f"[AGENT-CORTEX] Launched for '{agent_id}' on port {port} (pid={proc.pid})")
+
+        healthy = self._wait_healthy(port)
+        if not healthy:
+            proc.kill()
+            raise RuntimeError(
+                f"Agent Cortex for '{agent_id}' failed to start on port {port} "
+                f"within {_CORTEX_HEALTH_TIMEOUT}s"
+            )
+
+        log.info(f"[AGENT-CORTEX] '{agent_id}' is ready on port {port}")
+
+        info = {
+            "agent_id": agent_id,
+            "db_path": db_path,
+            "port": port,
+            "url": f"http://localhost:{port}",
+            "pid": proc.pid,
+            "process": proc,
+        }
+        with self._lock:
+            self._running[agent_id] = info
+
+        return {k: v for k, v in info.items() if k != "process"}
+
+    def release(self, agent_id: str):
+        """
+        Kill the Cortex process for agent_id.
+        Does NOT delete the db — it persists for future sessions.
+        """
+        with self._lock:
+            info = self._running.pop(agent_id, None)
+        if not info:
+            return
+        proc = info["process"]
+        try:
+            proc.terminate()
+            proc.wait(timeout=5)
+        except Exception:
+            try:
+                proc.kill()
+            except Exception:
+                pass
+        log.info(f"[AGENT-CORTEX] Released '{agent_id}' (port {info['port']})")
+
+    def list_agents(self) -> list:
+        """
+        List all known agents (those with db files in ~/cortex/agent-*.db).
+        Includes: agent_id, db_size_bytes, entry_count, is_running, port.
+        """
+        if not _CORTEX_DIR.exists():
+            return []
+
+        with self._lock:
+            running_ports = {aid: info["port"] for aid, info in self._running.items()}
+
+        agents = []
+        for db_file in sorted(_CORTEX_DIR.glob("agent-*.db")):
+            stem = db_file.stem  # e.g. "agent-overnight-builder"
+            agent_id = stem[len("agent-"):]
+            db_size = db_file.stat().st_size
+
+            entry_count = 0
+            try:
+                conn = sqlite3.connect(str(db_file))
+                entry_count = conn.execute("SELECT COUNT(*) FROM entries").fetchone()[0]
+                conn.close()
+            except Exception:
+                pass
+
+            agents.append({
+                "agent_id": agent_id,
+                "db_size_bytes": db_size,
+                "entry_count": entry_count,
+                "is_running": agent_id in running_ports,
+                "port": running_ports.get(agent_id),
+            })
+
+        return agents
+
+    def get_stats(self, agent_id: str) -> dict:
+        """
+        Return stats for a specific agent's Cortex.
+        Queries the SQLite db directly (no server required).
+        """
+        db_path = _CORTEX_DIR / f"agent-{agent_id}.db"
+        if not db_path.exists():
+            return {"error": f"No Cortex db found for agent '{agent_id}'"}
+
+        try:
+            conn = sqlite3.connect(str(db_path))
+            conn.row_factory = sqlite3.Row
+            total = conn.execute("SELECT COUNT(*) FROM entries").fetchone()[0]
+            db_size = db_path.stat().st_size
+
+            if total == 0:
+                conn.close()
+                return {
+                    "agent_id": agent_id,
+                    "entry_count": 0,
+                    "db_size_bytes": db_size,
+                    "oldest_entry": None,
+                    "newest_entry": None,
+                    "top_tags": [],
+                }
+
+            rows = conn.execute(
+                "SELECT content, tags, timestamp FROM entries ORDER BY timestamp"
+            ).fetchall()
+            oldest = rows[0]["timestamp"]
+            newest = rows[-1]["timestamp"]
+
+            tag_counts: dict = {}
+            for r in rows:
+                for t in json.loads(r["tags"]):
+                    tag_counts[t] = tag_counts.get(t, 0) + 1
+            top_tags = sorted(tag_counts.items(), key=lambda x: -x[1])[:10]
+            conn.close()
+
+            return {
+                "agent_id": agent_id,
+                "entry_count": total,
+                "db_size_bytes": db_size,
+                "oldest_entry": oldest,
+                "newest_entry": newest,
+                "top_tags": [{"tag": t, "count": c} for t, c in top_tags],
+            }
+        except Exception as e:
+            return {"error": str(e), "agent_id": agent_id}
+
+
+# Global agent cortex manager — one instance shared across all tasks
+agent_cortex_manager = AgentCortexManager()
 
 # ─── Database ────────────────────────────────────────
 def get_db() -> sqlite3.Connection:
@@ -90,6 +316,89 @@ def init_db():
 def check_auth(headers: dict) -> bool:
     auth = headers.get("authorization", "")
     return auth == f"Bearer {AUTH_TOKEN}"
+
+# ─── Skill loading ───────────────────────────────────
+def load_skill(skill_name: str) -> Optional[str]:
+    """
+    Load skill content from ~/claude/opensquid/skills/{skill}.md
+    or ~/claude/opensquid/skills/{skill}/SKILL.md.
+    Returns the file content, or None if not found.
+    """
+    skills_dir = Path(SKILLS_DIR)
+
+    # Try flat file first: skills/{skill}.md
+    flat_path = skills_dir / f"{skill_name}.md"
+    if flat_path.exists():
+        try:
+            return flat_path.read_text()
+        except Exception as e:
+            log.warning(f"[SKILL] Failed to read {flat_path}: {e}")
+
+    # Try subdirectory: skills/{skill}/SKILL.md
+    dir_path = skills_dir / skill_name / "SKILL.md"
+    if dir_path.exists():
+        try:
+            return dir_path.read_text()
+        except Exception as e:
+            log.warning(f"[SKILL] Failed to read {dir_path}: {e}")
+
+    return None
+
+
+def build_system_prompt_with_skill(skill: Optional[str], base_system_prompt: str) -> str:
+    """
+    If skill is provided, prepend the skill content to the system prompt.
+    Returns the (possibly modified) system prompt.
+    """
+    if not skill:
+        return base_system_prompt
+
+    skill_content = load_skill(skill)
+    if skill_content is None:
+        log.warning(f"[SKILL] Skill '{skill}' not found in {SKILLS_DIR}")
+        return base_system_prompt
+
+    return f"# Skill: {skill}\n\n{skill_content}\n\n---\n\n{base_system_prompt}"
+
+
+# ─── claude-code backend ─────────────────────────────
+def run_session_claude_code(
+    task_id: str,
+    prompt: str,
+    mcp_servers: Optional[dict] = None,
+    system_prompt: Optional[str] = None,
+) -> tuple:
+    """
+    Run a task using the claude CLI (claude-code backend).
+    mcp_servers: dict of {name: {url: ..., type: "http"}}
+    Returns: (stdout, stderr, returncode)
+    """
+    cli = "/home/jfischer/.npm-global/bin/claude"
+    env = os.environ.copy()
+    env.pop("CLAUDECODE", None)  # allow nested sessions
+    if "/usr/local/bin" not in env.get("PATH", ""):
+        env["PATH"] = "/usr/local/bin:" + env.get("PATH", "")
+
+    cmd = [cli, "--output-format", "json", "--max-turns", "20",
+           "--no-update-check", "-p", prompt]
+
+    if system_prompt:
+        cmd += ["--system-prompt", system_prompt]
+
+    if mcp_servers:
+        # mcp_servers is a dict of {name: {url: ..., type: "http"}}
+        # IMPORTANT: type must be "http" not "sse"
+        mcp_config = {"mcpServers": {}}
+        for name, cfg in mcp_servers.items():
+            mcp_config["mcpServers"][name] = {
+                "type": "http",
+                "url": cfg["url"]
+            }
+        cmd += ["--mcp-config", json.dumps(mcp_config)]
+
+    result = subprocess.run(cmd, capture_output=True, text=True, env=env, timeout=300)
+    return result.stdout, result.stderr, result.returncode
+
 
 # ─── Agent tool definitions for Claude ───────────────
 AGENT_TOOLS = [
@@ -232,22 +541,37 @@ async def get_http_client() -> httpx.AsyncClient:
         )
     return _http_client
 
-async def call_mcp_tool(tool_name: str, arguments: dict) -> str:
-    """Dispatch a tool call to the appropriate upstream MCP server."""
+async def call_mcp_tool(tool_name: str, arguments: dict, extra_endpoints: Optional[dict] = None) -> str:
+    """
+    Dispatch a tool call to the appropriate upstream MCP server.
+    extra_endpoints: optional dict of {tool_prefix: base_url} for dynamically added tools.
+    """
     client = await get_http_client()
 
     # Route to correct upstream
-    if tool_name.startswith("cortex_"):
-        url = f"{CORTEX_URL}/mcp"
-        method = tool_name
-    elif tool_name.startswith("openmind_"):
-        url = f"{OPENMIND_URL}/mcp"
-        method = tool_name.replace("openmind_", "")
-    elif tool_name.startswith("dev_"):
-        url = f"{RWX_URL}/mcp"
-        method = tool_name
-    else:
-        return json.dumps({"error": f"Unknown tool: {tool_name}"})
+    url = None
+    method = tool_name
+
+    # Check extra (dynamic) endpoints first (e.g. isolated cortex tools)
+    if extra_endpoints:
+        for prefix, base_url in extra_endpoints.items():
+            if tool_name.startswith(prefix):
+                url = f"{base_url}/mcp"
+                method = tool_name
+                break
+
+    if url is None:
+        if tool_name.startswith("cortex_"):
+            url = f"{CORTEX_URL}/mcp"
+            method = tool_name
+        elif tool_name.startswith("openmind_"):
+            url = f"{OPENMIND_URL}/mcp"
+            method = tool_name.replace("openmind_", "")
+        elif tool_name.startswith("dev_"):
+            url = f"{RWX_URL}/mcp"
+            method = tool_name
+        else:
+            return json.dumps({"error": f"Unknown tool: {tool_name}"})
 
     # MCP JSON-RPC call
     payload = {
@@ -276,105 +600,245 @@ async def call_mcp_tool(tool_name: str, arguments: dict) -> str:
         return json.dumps({"error": str(e)})
 
 # ─── Agentic loop ────────────────────────────────────
-async def run_agent_loop(task_id: str, prompt: str) -> str:
-    """Execute the agentic loop: Claude + tools until done or max steps."""
+async def run_agent_loop(
+    task_id: str,
+    prompt: str,
+    backend: str = "api",
+    skill: Optional[str] = None,
+    isolated_cortex: bool = False,
+) -> str:
+    """
+    Execute the agentic loop: Claude + tools until done or max steps.
+
+    backend: 'api' (default Anthropic API loop) or 'claude-code' (CLI subprocess)
+    skill: optional skill name to prepend to system prompt
+    isolated_cortex: if True, provision a private per-task Cortex instance
+    """
     db = get_db()
     now = datetime.datetime.utcnow().isoformat()
     db.execute("UPDATE tasks SET status='running', updated_at=? WHERE id=?", (now, task_id))
     db.commit()
 
-    # Load SOUL.md as system prompt
+    # Load SOUL.md as base system prompt
     soul = ""
     try:
         soul = Path(SOUL_PATH).read_text()
     except Exception:
         soul = "You are J's personal AI infrastructure."
 
-    client = anthropic.Anthropic()
-    messages = [{"role": "user", "content": prompt}]
-    step_num = 0
+    # Apply skill overlay if requested
+    system_prompt = build_system_prompt_with_skill(skill, soul)
+
+    # Provision isolated cortex if requested
+    cortex_info = None
+    cortex_agent_id = f"task-{task_id}"
+    if isolated_cortex:
+        try:
+            cortex_info = agent_cortex_manager.provision(cortex_agent_id)
+            log.info(f"[AGENT] Isolated cortex provisioned for task {task_id} on port {cortex_info['port']}")
+        except Exception as e:
+            log.error(f"[AGENT] Failed to provision isolated cortex for task {task_id}: {e}")
+            cortex_info = None
+
     final_result = ""
 
     try:
-        while step_num < MAX_AGENT_STEPS:
-            step_num += 1
-            log.info(f"[AGENT] Task {task_id} step {step_num}")
+        # ── claude-code backend ───────────────────────────────────────────────
+        if backend == "claude-code":
+            mcp_servers = None
+            if cortex_info:
+                mcp_servers = {
+                    "task-cortex": {
+                        "type": "http",
+                        "url": f"{cortex_info['url']}/mcp",
+                    }
+                }
 
-            response = client.messages.create(
-                model=CLAUDE_MODEL,
-                max_tokens=4096,
-                system=soul,
-                tools=AGENT_TOOLS,
-                messages=messages
-            )
+            log.info(f"[AGENT] Task {task_id} using claude-code backend")
+            try:
+                stdout, stderr, returncode = run_session_claude_code(
+                    task_id=task_id,
+                    prompt=prompt,
+                    mcp_servers=mcp_servers,
+                    system_prompt=system_prompt if system_prompt != soul else None,
+                )
+                if stderr:
+                    log.warning(f"[AGENT] Task {task_id} claude-code stderr: {stderr[:2000]}")
 
-            # Check for end of turn
-            if response.stop_reason == "end_turn":
-                # Extract final text
-                texts = [b.text for b in response.content if b.type == "text"]
-                final_result = "\n".join(texts)
-                # Log final step
+                final_result = stdout.strip() if stdout else f"[returncode={returncode}]"
+
+                # Log a single step for the claude-code result
                 db.execute(
                     "INSERT INTO task_steps (id, task_id, step_num, action, result, ts) VALUES (?,?,?,?,?,?)",
-                    (str(uuid.uuid4()), task_id, step_num, "end_turn", final_result, datetime.datetime.utcnow().isoformat())
+                    (str(uuid.uuid4()), task_id, 1, "claude-code", final_result[:2000], datetime.datetime.utcnow().isoformat())
                 )
                 db.commit()
-                break
 
-            # Process tool_use blocks
-            if response.stop_reason == "tool_use":
-                # Add assistant response to messages
-                messages.append({"role": "assistant", "content": response.content})
+                if returncode == 0:
+                    now = datetime.datetime.utcnow().isoformat()
+                    db.execute(
+                        "UPDATE tasks SET status='completed', result=?, updated_at=? WHERE id=?",
+                        (final_result[:10000], now, task_id)
+                    )
+                else:
+                    now = datetime.datetime.utcnow().isoformat()
+                    db.execute(
+                        "UPDATE tasks SET status='failed', result=?, updated_at=? WHERE id=?",
+                        (final_result[:10000], now, task_id)
+                    )
+                db.commit()
 
-                tool_results = []
-                for block in response.content:
-                    if block.type == "tool_use":
-                        tool_name = block.name
-                        tool_input = block.input
-                        log.info(f"[AGENT] Tool call: {tool_name}({json.dumps(tool_input)[:200]})")
+            except Exception as e:
+                log.error(f"[AGENT] Task {task_id} claude-code backend failed: {e}")
+                now = datetime.datetime.utcnow().isoformat()
+                db.execute(
+                    "UPDATE tasks SET status='failed', result=?, updated_at=? WHERE id=?",
+                    (str(e)[:5000], now, task_id)
+                )
+                db.commit()
+                final_result = f"Error: {e}"
 
-                        # Log step
+        # ── API backend (default) ─────────────────────────────────────────────
+        else:
+            # Build tool list — add isolated cortex tools if provisioned
+            tools = list(AGENT_TOOLS)
+            extra_endpoints: Optional[dict] = None
+
+            if cortex_info:
+                # Add cortex tools pointing at the isolated instance
+                isolated_cortex_tools = [
+                    {
+                        "name": "task_cortex_store",
+                        "description": "Store an entry in this task's isolated Cortex memory.",
+                        "input_schema": {
+                            "type": "object",
+                            "properties": {
+                                "content": {"type": "string", "description": "Text content to store"},
+                                "tags": {"type": "array", "items": {"type": "string"}, "description": "Tags"},
+                                "source": {"type": "string", "description": "Source context"}
+                            },
+                            "required": ["content"]
+                        }
+                    },
+                    {
+                        "name": "task_cortex_search",
+                        "description": "Full-text search in this task's isolated Cortex memory.",
+                        "input_schema": {
+                            "type": "object",
+                            "properties": {
+                                "query": {"type": "string", "description": "Search query"},
+                                "limit": {"type": "integer", "description": "Max results", "default": 10}
+                            },
+                            "required": ["query"]
+                        }
+                    },
+                    {
+                        "name": "task_cortex_semantic_search",
+                        "description": "Semantic search in this task's isolated Cortex memory.",
+                        "input_schema": {
+                            "type": "object",
+                            "properties": {
+                                "query": {"type": "string", "description": "Natural language query"},
+                                "limit": {"type": "integer", "description": "Max results", "default": 5}
+                            },
+                            "required": ["query"]
+                        }
+                    },
+                ]
+                tools = tools + isolated_cortex_tools
+                extra_endpoints = {"task_cortex_": cortex_info["url"]}
+
+            client = anthropic.Anthropic()
+            messages = [{"role": "user", "content": prompt}]
+            step_num = 0
+
+            try:
+                while step_num < MAX_AGENT_STEPS:
+                    step_num += 1
+                    log.info(f"[AGENT] Task {task_id} step {step_num}")
+
+                    response = client.messages.create(
+                        model=CLAUDE_MODEL,
+                        max_tokens=4096,
+                        system=system_prompt,
+                        tools=tools,
+                        messages=messages
+                    )
+
+                    # Check for end of turn
+                    if response.stop_reason == "end_turn":
+                        # Extract final text
+                        texts = [b.text for b in response.content if b.type == "text"]
+                        final_result = "\n".join(texts)
+                        # Log final step
                         db.execute(
                             "INSERT INTO task_steps (id, task_id, step_num, action, result, ts) VALUES (?,?,?,?,?,?)",
-                            (str(uuid.uuid4()), task_id, step_num, f"tool_use:{tool_name}", json.dumps(tool_input)[:2000], datetime.datetime.utcnow().isoformat())
+                            (str(uuid.uuid4()), task_id, step_num, "end_turn", final_result, datetime.datetime.utcnow().isoformat())
                         )
                         db.commit()
+                        break
 
-                        # Execute tool
-                        result = await call_mcp_tool(tool_name, tool_input)
-                        tool_results.append({
-                            "type": "tool_result",
-                            "tool_use_id": block.id,
-                            "content": result[:8000]
-                        })
+                    # Process tool_use blocks
+                    if response.stop_reason == "tool_use":
+                        # Add assistant response to messages
+                        messages.append({"role": "assistant", "content": response.content})
 
-                messages.append({"role": "user", "content": tool_results})
-            else:
-                # Unexpected stop reason — extract text and stop
-                texts = [b.text for b in response.content if b.type == "text"]
-                final_result = "\n".join(texts) if texts else f"Stopped: {response.stop_reason}"
-                break
+                        tool_results = []
+                        for block in response.content:
+                            if block.type == "tool_use":
+                                tool_name = block.name
+                                tool_input = block.input
+                                log.info(f"[AGENT] Tool call: {tool_name}({json.dumps(tool_input)[:200]})")
 
-        # Update task as completed
-        now = datetime.datetime.utcnow().isoformat()
-        db.execute(
-            "UPDATE tasks SET status='completed', result=?, updated_at=? WHERE id=?",
-            (final_result[:10000], now, task_id)
-        )
-        db.commit()
+                                # Log step
+                                db.execute(
+                                    "INSERT INTO task_steps (id, task_id, step_num, action, result, ts) VALUES (?,?,?,?,?,?)",
+                                    (str(uuid.uuid4()), task_id, step_num, f"tool_use:{tool_name}", json.dumps(tool_input)[:2000], datetime.datetime.utcnow().isoformat())
+                                )
+                                db.commit()
 
-    except Exception as e:
-        log.error(f"[AGENT] Task {task_id} failed: {e}")
-        now = datetime.datetime.utcnow().isoformat()
-        db.execute(
-            "UPDATE tasks SET status='failed', result=?, updated_at=? WHERE id=?",
-            (str(e)[:5000], now, task_id)
-        )
-        db.commit()
-        final_result = f"Error: {e}"
+                                # Execute tool
+                                result = await call_mcp_tool(tool_name, tool_input, extra_endpoints=extra_endpoints)
+                                tool_results.append({
+                                    "type": "tool_result",
+                                    "tool_use_id": block.id,
+                                    "content": result[:8000]
+                                })
+
+                        messages.append({"role": "user", "content": tool_results})
+                    else:
+                        # Unexpected stop reason — extract text and stop
+                        texts = [b.text for b in response.content if b.type == "text"]
+                        final_result = "\n".join(texts) if texts else f"Stopped: {response.stop_reason}"
+                        break
+
+                # Update task as completed
+                now = datetime.datetime.utcnow().isoformat()
+                db.execute(
+                    "UPDATE tasks SET status='completed', result=?, updated_at=? WHERE id=?",
+                    (final_result[:10000], now, task_id)
+                )
+                db.commit()
+
+            except Exception as e:
+                log.error(f"[AGENT] Task {task_id} failed: {e}")
+                now = datetime.datetime.utcnow().isoformat()
+                db.execute(
+                    "UPDATE tasks SET status='failed', result=?, updated_at=? WHERE id=?",
+                    (str(e)[:5000], now, task_id)
+                )
+                db.commit()
+                final_result = f"Error: {e}"
 
     finally:
         db.close()
+        # Release isolated cortex if it was provisioned
+        if isolated_cortex and cortex_info:
+            try:
+                agent_cortex_manager.release(cortex_agent_id)
+                log.info(f"[AGENT] Isolated cortex released for task {task_id}")
+            except Exception as e:
+                log.error(f"[AGENT] Failed to release isolated cortex for task {task_id}: {e}")
 
     return final_result
 
@@ -437,8 +901,30 @@ async def run_scheduled(schedule_id: str, prompt: str):
 mcp = FastMCP("daemon-server")
 
 @mcp.tool()
-async def daemon_task_create(title: str, prompt: str) -> str:
-    """Create a new daemon task and start the agentic loop."""
+async def daemon_task_create(
+    title: str,
+    prompt: str,
+    backend: str = "api",
+    skill: Optional[str] = None,
+    isolated_cortex: bool = False,
+) -> str:
+    """
+    Create a new daemon task and start the agentic loop.
+
+    Args:
+        title: Short descriptive title for the task.
+        prompt: The task prompt / goal to execute.
+        backend: Execution backend — 'api' (default Anthropic API loop) or
+                 'claude-code' (claude CLI subprocess).
+        skill: Optional skill name. If provided, loads
+               ~/claude/opensquid/skills/{skill}.md or
+               ~/claude/opensquid/skills/{skill}/SKILL.md and prepends it
+               to the system prompt.
+        isolated_cortex: If True, provisions a private per-task Cortex
+                         instance (agent-{task_id}.db on a port in 8300-8399)
+                         and exposes it as an MCP tool. The Cortex is released
+                         after the task completes.
+    """
     task_id = str(uuid.uuid4())
     now = datetime.datetime.utcnow().isoformat()
     db = get_db()
@@ -448,12 +934,25 @@ async def daemon_task_create(title: str, prompt: str) -> str:
     )
     db.commit()
     db.close()
-    log.info(f"[TASK] Created {task_id}: {title}")
+    log.info(f"[TASK] Created {task_id}: {title} (backend={backend}, skill={skill}, isolated_cortex={isolated_cortex})")
 
     # Fire and forget the agent loop
-    asyncio.create_task(run_agent_loop(task_id, prompt))
+    asyncio.create_task(run_agent_loop(
+        task_id,
+        prompt,
+        backend=backend,
+        skill=skill,
+        isolated_cortex=isolated_cortex,
+    ))
 
-    return json.dumps({"task_id": task_id, "status": "pending", "title": title})
+    return json.dumps({
+        "task_id": task_id,
+        "status": "pending",
+        "title": title,
+        "backend": backend,
+        "skill": skill,
+        "isolated_cortex": isolated_cortex,
+    })
 
 @mcp.tool()
 async def daemon_task_status(task_id: str) -> str:
@@ -577,6 +1076,8 @@ async def daemon_webhook_create(name: str, prompt_template: str) -> str:
 # ─── Webhook HTTP endpoint ──────────────────────────
 from starlette.requests import Request as StarletteRequest
 from starlette.responses import JSONResponse
+from fastapi.responses import StreamingResponse
+from fastapi import Request, HTTPException
 
 async def webhook_handler(request: StarletteRequest):
     """Handle incoming webhook POST requests."""
@@ -623,6 +1124,65 @@ async def webhook_handler(request: StarletteRequest):
     log.info(f"[WEBHOOK] Triggered {webhook_id} → task {task_id}")
     return JSONResponse({"task_id": task_id, "status": "pending"})
 
+# ─── SSE streaming endpoint ───────────────────────────
+async def stream_task_handler(request: Request):
+    """SSE stream for task steps. GET /stream/{task_id}"""
+    task_id = request.path_params.get("task_id", "")
+
+    # Auth check (Bearer emc2ymmv)
+    auth = request.headers.get("Authorization", "")
+    if auth != f"Bearer {AUTH_TOKEN}":
+        return JSONResponse({"error": "Unauthorized"}, status_code=401)
+
+    async def event_generator():
+        last_step_id_val = None  # track by rowid since step ids are UUIDs
+
+        # We track the rowid of the last seen task_step row
+        last_rowid = 0
+        while True:
+            # Check if client disconnected
+            if await request.is_disconnected():
+                break
+
+            # Get new steps from DB using rowid for ordering
+            db = get_db()
+            rows = db.execute(
+                "SELECT rowid, id, step_num, action, result, ts FROM task_steps "
+                "WHERE task_id=? AND rowid>? ORDER BY rowid",
+                (task_id, last_rowid)
+            ).fetchall()
+            db.close()
+
+            for row in rows:
+                last_rowid = row["rowid"]
+                data = json.dumps({
+                    "id": row["id"],
+                    "step_num": row["step_num"],
+                    "action": row["action"],
+                    "content": row["result"],
+                    "created_at": row["ts"],
+                })
+                yield f"data: {data}\n\n"
+
+            # Check if task is done
+            db = get_db()
+            task = db.execute(
+                "SELECT status FROM tasks WHERE id=?", (task_id,)
+            ).fetchone()
+            db.close()
+
+            if task and task["status"] in ("completed", "failed", "cancelled"):
+                yield f"data: {json.dumps({'event': 'done', 'status': task['status']})}\n\n"
+                break
+
+            await asyncio.sleep(0.5)
+
+    return StreamingResponse(
+        event_generator(),
+        media_type="text/event-stream",
+        headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+    )
+
 # ─── Scheduler setup ────────────────────────────────
 scheduler = AsyncIOScheduler()
 
@@ -654,16 +1214,17 @@ def load_schedules():
 
 # ─── App startup ─────────────────────────────────────
 def create_app():
-    """Create the ASGI app with MCP + webhook routes."""
+    """Create the ASGI app with MCP + webhook + SSE stream routes."""
     from starlette.applications import Starlette
     from starlette.routing import Route, Mount
 
     # Get the MCP ASGI app
     mcp_app = mcp.http_app(path="/mcp")
 
-    # Add webhook route
+    # Add webhook and stream routes
     routes = [
         Route("/webhook/{webhook_id}", webhook_handler, methods=["POST"]),
+        Route("/stream/{task_id}", stream_task_handler, methods=["GET"]),
     ]
 
     # Mount MCP app and add custom routes
