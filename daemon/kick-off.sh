@@ -7,7 +7,8 @@ export OPENSQUID_ROOT="/home/jfischer/claude/opensquid"
 cd ~/claude/opensquid/daemon
 
 # Kill existing process on port 8256
-fuser -k 8256/tcp 2>/dev/null || true
+pid=$(ss -tlnp 2>/dev/null | awk '/:8256 /{match($0, /pid=([0-9]+)/, m); if (m[1]) print m[1]}')
+if [ -n "$pid" ]; then kill "$pid" 2>/dev/null || true; fi
 sleep 1
 
 # Activate venv
