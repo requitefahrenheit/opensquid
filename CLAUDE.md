@@ -15,17 +15,22 @@ Identity document: `SOUL.md`. Active directives: `HEARTBEAT.md`.
 ## Repository Layout
 
 ```
-~/claude/opensquid/
-  daemon/           # Core agentic loop, task queue, heartbeat (port 8256)
-  channels/         # Telegram + future messaging integrations (port 8257)
-  browser/          # httpx + bs4 web browsing (port 8258)
-  voice-wake/       # pvporcupine wake word detection (local only)
-  skills/           # Skill markdown files injected per task
-  SOUL.md           # Identity document
-  HEARTBEAT.md      # Directive file
-  CLAUDE.md         # This file
-  watchdog.sh       # Service supervisor
+<opensquid-root>/       # Wherever you cloned it (~/claude/opensquid or ~/squid etc.)
+  daemon/               # Core agentic loop, task queue, heartbeat (port 8256)
+  channels/             # Telegram + future messaging integrations (port 8257)
+  browser/              # httpx + bs4 web browsing (port 8258)
+  voice-wake/           # pvporcupine wake word detection (local only)
+  skills/               # Skill markdown files injected per task
+  .env                  # Platform config (copy from .env.mac or .env.example)
+  SOUL.md               # Identity document
+  HEARTBEAT.md          # Directive file
+  CLAUDE.md             # This file
+  watchdog.sh           # Service supervisor
 ```
+
+**Platform config** — all paths and credentials live in `.env`. Copy the right template:
+- Mac: `cp .env.mac .env` then fill in `ANTHROPIC_API_KEY` and verify `OPENSQUID_PYTHON`
+- Linux: `cp .env.example .env` then adjust
 
 ---
 
@@ -144,11 +149,10 @@ Each service has a `kick-off.sh` that follows this pattern:
 
 Example for daemon:
 ```bash
-fuser -k 8256/tcp 2>/dev/null || true
-cd ~/claude/opensquid/daemon
-source venv/bin/activate
-nohup python3 daemon-server.py >> daemon.log 2>&1 &
+bash daemon/kick-off.sh
 ```
+
+All kick-off.sh scripts source `.env` automatically via `SCRIPT_DIR`.
 
 ---
 
@@ -197,7 +201,7 @@ When `backend='claude-code'`, the daemon invokes the Claude Code CLI as a subpro
 
 Key requirements:
 
-- **CLI path**: `/home/jfischer/.npm-global/bin/claude`
+- **CLI path**: read from `OPENSQUID_CLAUDE_CLI` env var (default: `~/.npm-global/bin/claude`)
 - **MCP config type**: must be `"http"`, not `"sse"`
 - **Nested session isolation**: pop `CLAUDECODE` from the environment before invoking:
   ```python
