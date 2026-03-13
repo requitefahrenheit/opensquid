@@ -168,6 +168,37 @@ Final commit: "feat(merge): Parity + OpenSquid unified architecture"
 
 ---
 
+## AMENDMENT — Dual Memory: Cortex + Markdown
+
+Added March 13, 2026. Implement alongside the core merge.
+
+Every Cortex store operation in the daemon should ALSO append the same content to a daily Markdown log. Dual format: Cortex for semantic search, Markdown for human-readable history and git diffability.
+
+Workspace layout to create at ~/claude/opensquid/:
+```
+memory/
+  YYYY-MM-DD.md    # daily append-only log (auto-created by daemon)
+MEMORY.md          # curated long-term facts (updated in place by agent)
+SOUL.md            # identity (already exists)
+HEARTBEAT.md      # directives (already exists)
+```
+
+Implementation:
+1. In daemon agentic loop: after every cortex_store call, append same content to ~/claude/opensquid/memory/YYYY-MM-DD.md with a timestamp header
+2. Pre-compaction flush: before context limit hit, fire silent turn writing to BOTH Cortex and today's markdown log
+3. MEMORY.md = canonical long-term facts, updated in place (not appended). Agent can read/write this directly.
+4. Daily logs are append-only. Never edit, only append.
+
+Format for daily log entries:
+```markdown
+## HH:MM — <source or tag>
+<content>
+```
+
+This mirrors OpenClaw's memory layout exactly, which means tools and patterns from that ecosystem will be compatible. Zero downside to having both.
+
+---
+
 ## Done When
 
 1. ~/claude/opensquid/ directory exists with full structure

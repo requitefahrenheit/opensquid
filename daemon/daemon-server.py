@@ -569,6 +569,27 @@ async def get_http_client() -> httpx.AsyncClient:
         )
     return _http_client
 
+# ─── Dual memory: mirror Cortex stores to Markdown ──────────────────────────
+MEMORY_DIR = Path(os.path.expanduser("~/claude/opensquid/memory"))
+
+def _mirror_to_markdown(content: str, tags: list, source: str) -> None:
+    """Append a Cortex store to today's daily Markdown log."""
+    try:
+        MEMORY_DIR.mkdir(parents=True, exist_ok=True)
+        today = datetime.date.today().isoformat()
+        log_path = MEMORY_DIR / f"{today}.md"
+        now = datetime.datetime.utcnow().strftime("%H:%M")
+        tag_str = f"  tags: {', '.join(tags)}" if tags else ""
+        src_str = f"  source: {source}" if source else ""
+        header_parts = [p for p in [tag_str, src_str] if p]
+        header = f"  ({'; '.join(header_parts)})" if header_parts else ""
+        entry = f"\n## {now}{header}\n{content}\n"
+        with open(log_path, "a") as f:
+            f.write(entry)
+    except Exception as e:
+        log.warning(f"[MEMORY] Failed to mirror to markdown: {e}")
+
+
 async def call_mcp_tool(tool_name: str, arguments: dict, extra_endpoints: Optional[dict] = None) -> str:
     """
     Dispatch a tool call to the appropriate upstream MCP server.
@@ -619,7 +640,15 @@ async def call_mcp_tool(tool_name: str, arguments: dict, extra_endpoints: Option
         if "result" in data:
             content = data["result"].get("content", [])
             texts = [c.get("text", "") for c in content if c.get("type") == "text"]
-            return "\n".join(texts) if texts else json.dumps(data["result"])
+            result_text = "\n".join(texts) if texts else json.dumps(data["result"])
+            # Mirror cortex_store to daily Markdown log
+            if tool_name in ("cortex_store", "task_cortex_store"):
+                _mirror_to_markdown(
+                    content=arguments.get("content", ""),
+                    tags=arguments.get("tags", []),
+                    source=arguments.get("source", ""),
+                )
+            return result_text
         elif "error" in data:
             return json.dumps(data["error"])
         return json.dumps(data)
