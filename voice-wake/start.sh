@@ -2,7 +2,7 @@
 # Start voice-wake daemon (no port — just nohup start)
 set -e
 
-cd ~/claude/parity/voice-wake
+cd ~/claude/opensquid/voice-wake
 
 # Kill existing if running
 pkill -f "voice-wake.py" 2>/dev/null || true

@@ -141,7 +141,7 @@ def route_transcript(text: str) -> str:
         log.info(f"[ROUTE] → daemon: {text}")
         try:
             resp = _http.post(
-                f"{DAEMON_URL}/api/task",
+                f"{DAEMON_URL}/tasks",
                 json={"title": f"Voice: {text[:60]}", "prompt": text},
             )
             resp.raise_for_status()

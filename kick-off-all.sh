@@ -1,13 +1,6 @@
 #!/bin/bash
-# Kill old processes, then start all opensquid services
+# Start all opensquid services (each kick-off.sh handles its own port cleanup)
 OPENSQUID=~/claude/opensquid
-LOG=$OPENSQUID/daemon/daemon.log
-
-# Kill existing processes
-fuser -k 8256/tcp 2>/dev/null || true
-fuser -k 8257/tcp 2>/dev/null || true
-fuser -k 8258/tcp 2>/dev/null || true
-sleep 1
 
 # Start daemon (primary service)
 bash $OPENSQUID/daemon/kick-off.sh

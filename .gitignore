@@ -9,3 +9,6 @@ __pycache__/
 .nfs*
 *.pid
 run-merge.sh
+launch.sh
+merge.log
+merge.pid
