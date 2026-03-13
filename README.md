@@ -49,9 +49,23 @@ Upstream dependencies (not managed here):
 
 ---
 
-## daemon-server.py
+## daemon/daemon-server.py
 
 The primary service. Runs on port **8256**.
+
+### HTTP API (auth: `Authorization: Bearer emc2ymmv`)
+
+| Method | Path | Description |
+|--------|------|-------------|
+| POST   | /tasks | Create a task |
+| GET    | /tasks | List recent tasks |
+| GET    | /tasks/{id} | Task details + steps |
+| DELETE | /tasks/{id} | Cancel a task |
+| GET    | /stream/{task_id} | SSE live stream of task_steps |
+| POST   | /run | Alias: create a task (dispatcher compat) |
+| GET    | /sessions | Alias: list tasks |
+| GET    | /status/{id} | Alias: task details |
+| POST   | /webhook/{id} | Trigger a webhook |
 
 ### MCP tools (at `/mcp`)
 
@@ -66,39 +80,21 @@ The primary service. Runs on port **8256**.
 | `daemon_schedule_list` | List all schedules |
 | `daemon_webhook_create` | Create a webhook endpoint |
 
-### HTTP API (auth: `Authorization: Bearer emc2ymmv`)
-
-| Method | Path | Description |
-|--------|------|-------------|
-| GET    | /health | Health check |
-| POST   | /run | Create a task (OpenSquid dispatcher compat) |
-| GET    | /sessions | List recent tasks |
-| GET    | /status/{task_id} | Task details + steps |
-| GET    | /stream/{task_id} | SSE live stream of task_steps |
-| GET    | /skills | List available skills |
-| GET    | /agents | List agent Cortex instances |
-| GET    | /agents/{id} | Agent Cortex stats |
-| DELETE | /agents/{id}/memory?confirm=true | Delete agent memory db |
-| POST   | /webhook/{id} | Trigger a webhook |
-
-### POST /run body
+### POST /tasks body
 
 ```json
 {
-  "title": "optional title",
+  "title": "short label",
   "prompt": "the task prompt",
   "backend": "api",
-  "skills": ["overnight-builder"],
-  "isolated_memory": false,
-  "agent_id": "my-agent",
-  "budget": 5.0
+  "skill": "overnight-builder",
+  "isolated_cortex": false
 }
 ```
 
 - `backend`: `"api"` (raw Anthropic SDK loop) or `"claude-code"` (claude CLI)
-- `isolated_memory`: if true, provisions a private Cortex DB on port 8300–8399
-- `skills`: list of skill names to inject into the system prompt
-- `agent_id`: used as the Cortex agent identifier for memory isolation
+- `skill`: skill name to inject into system prompt (`isolated_memory` also accepted)
+- `isolated_cortex`: provision a private Cortex DB on port 8300–8399
 
 ---
 
@@ -117,8 +113,7 @@ The daemon runs two backends:
 **Claude Code** (`backend: "claude-code"`):
 - Invokes `~/.npm-global/bin/claude` CLI with `--dangerously-skip-permissions`
 - Full tool access via claude's built-in tools
-- If `isolated_memory=True`, injects per-task Cortex MCP config (type: `"http"`)
-- Output written to `sessions/{task_id}/output.log`
+- If `isolated_cortex=True`, injects per-task Cortex MCP config (type: `"http"`)
 
 ---
 
@@ -126,7 +121,7 @@ The daemon runs two backends:
 
 Skills live in `skills/*/SKILL.md` with YAML frontmatter (`name`, `description`) and instruction body.
 
-Skills are injected into the system prompt when specified in the task's `skills` array. Available skills:
+Skills are injected into the system prompt when specified via `skill` in the task body. Available skills:
 
 - **overnight-builder** — autonomous overnight build agent
 - **smooth-web-animation** — WebGPU/WGSL animation patterns
@@ -163,16 +158,16 @@ Agent DBs live at `~/cortex/agent-{agent_id}.db`.
 
 ```bash
 cd ~/claude/opensquid
-bash setup.sh        # create venv, install deps (first run only)
-bash kick-off.sh     # kill old processes, start daemon + browser
+bash daemon/setup.sh     # create daemon venv, install deps (first run only)
+bash kick-off.sh         # kill old processes, start daemon + browser
 ```
 
 For channels (Telegram):
 ```bash
 cp .env.example .env
 # Edit .env: add TELEGRAM_BOT_TOKEN and TELEGRAM_ALLOWED_IDS
-source venv/bin/activate
-python3 channels-server.py
+bash channels/setup.sh
+bash channels/kick-off.sh
 ```
 
 ---
