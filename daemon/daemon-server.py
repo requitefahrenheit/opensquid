@@ -25,8 +25,8 @@ from apscheduler.triggers.cron import CronTrigger
 # ─── Config ──────────────────────────────────────────
 PORT = int(os.environ.get("DAEMON_PORT", 8256))
 DB_PATH = os.environ.get("DAEMON_DB", os.path.expanduser("~/claude/opensquid/daemon/daemon.db"))
-SOUL_PATH = os.path.expanduser("~/claude/opensquid/daemon/SOUL.md")
-HEARTBEAT_PATH = os.path.expanduser("~/claude/opensquid/daemon/HEARTBEAT.md")
+SOUL_PATH = os.path.expanduser("~/claude/opensquid/SOUL.md")
+HEARTBEAT_PATH = os.path.expanduser("~/claude/opensquid/HEARTBEAT.md")
 HEARTBEAT_LOG = os.path.expanduser("~/claude/opensquid/daemon/heartbeat.log")
 AUTH_TOKEN = os.environ.get("DAEMON_AUTH_TOKEN", "emc2ymmv")
 MAX_AGENT_STEPS = 20
