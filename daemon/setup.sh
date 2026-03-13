@@ -2,11 +2,12 @@
 # Setup script for daemon-server
 set -e
 
-cd ~/claude/opensquid/daemon
-
-# Create virtual environment (use miniconda Python 3.12)
-ENV_FILE="$(dirname "$0")/../.env"
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+ENV_FILE="$SCRIPT_DIR/../.env"
 [ -f "$ENV_FILE" ] && set -a && source "$ENV_FILE" && set +a
+cd "$SCRIPT_DIR"
+
+# Create virtual environment
 PYTHON="${OPENSQUID_PYTHON:-$(which python3)}"
 $PYTHON -m venv venv
 source venv/bin/activate
