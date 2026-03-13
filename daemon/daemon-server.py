@@ -24,10 +24,10 @@ from apscheduler.triggers.cron import CronTrigger
 
 # ─── Config ──────────────────────────────────────────
 PORT = int(os.environ.get("DAEMON_PORT", 8256))
-DB_PATH = os.environ.get("DAEMON_DB", os.path.expanduser("~/claude/parity/daemon/daemon.db"))
-SOUL_PATH = os.path.expanduser("~/claude/parity/daemon/SOUL.md")
-HEARTBEAT_PATH = os.path.expanduser("~/claude/parity/daemon/HEARTBEAT.md")
-HEARTBEAT_LOG = os.path.expanduser("~/claude/parity/daemon/heartbeat.log")
+DB_PATH = os.environ.get("DAEMON_DB", os.path.expanduser("~/claude/opensquid/daemon/daemon.db"))
+SOUL_PATH = os.path.expanduser("~/claude/opensquid/daemon/SOUL.md")
+HEARTBEAT_PATH = os.path.expanduser("~/claude/opensquid/daemon/HEARTBEAT.md")
+HEARTBEAT_LOG = os.path.expanduser("~/claude/opensquid/daemon/heartbeat.log")
 AUTH_TOKEN = os.environ.get("DAEMON_AUTH_TOKEN", "emc2ymmv")
 MAX_AGENT_STEPS = 20
 CLAUDE_MODEL = "claude-opus-4-20250514"
@@ -379,25 +379,43 @@ def run_session_claude_code(
     if "/usr/local/bin" not in env.get("PATH", ""):
         env["PATH"] = "/usr/local/bin:" + env.get("PATH", "")
 
-    cmd = [cli, "--output-format", "json", "--max-turns", "20",
-           "--no-update-check", "-p", prompt]
+    # Ensure node is on PATH (claude CLI requires it)
+    node_paths = ["/usr/local/bin", "/usr/bin", "/home/jfischer/.npm-global/bin"]
+    existing_path = env.get("PATH", "")
+    extra = ":".join(p for p in node_paths if p not in existing_path)
+    if extra:
+        env["PATH"] = extra + ":" + existing_path
 
-    if system_prompt:
-        cmd += ["--system-prompt", system_prompt]
+    # Build combined prompt — prepend system_prompt if provided
+    full_prompt = f"{system_prompt}\n\n---\n\n{prompt}" if system_prompt else prompt
 
-    if mcp_servers:
-        # mcp_servers is a dict of {name: {url: ..., type: "http"}}
-        # IMPORTANT: type must be "http" not "sse"
-        mcp_config = {"mcpServers": {}}
-        for name, cfg in mcp_servers.items():
-            mcp_config["mcpServers"][name] = {
-                "type": "http",
-                "url": cfg["url"]
-            }
-        cmd += ["--mcp-config", json.dumps(mcp_config)]
+    mcp_config_path = None
+    try:
+        cmd = [cli, "--dangerously-skip-permissions", "--max-budget-usd", "5.0"]
 
-    result = subprocess.run(cmd, capture_output=True, text=True, env=env, timeout=300)
-    return result.stdout, result.stderr, result.returncode
+        if mcp_servers:
+            # IMPORTANT: type must be "http" not "sse" (dual-server uses streamable HTTP)
+            mcp_config_path = f"/tmp/daemon-mcp-{task_id}.json"
+            mcp_config = {"mcpServers": {}}
+            for name, cfg in mcp_servers.items():
+                mcp_config["mcpServers"][name] = {
+                    "type": "http",
+                    "url": cfg["url"]
+                }
+            with open(mcp_config_path, "w") as f:
+                json.dump(mcp_config, f)
+            cmd += ["--mcp-config", mcp_config_path]
+
+        cmd += ["-p", full_prompt]
+
+        result = subprocess.run(cmd, capture_output=True, text=True, env=env, timeout=300)
+        return result.stdout, result.stderr, result.returncode
+    finally:
+        if mcp_config_path:
+            try:
+                os.unlink(mcp_config_path)
+            except Exception:
+                pass
 
 
 # ─── Agent tool definitions for Claude ───────────────
@@ -1073,11 +1091,9 @@ async def daemon_webhook_create(name: str, prompt_template: str) -> str:
     log.info(f"[WEBHOOK] Created {webhook_id}: {name}")
     return json.dumps({"webhook_id": webhook_id, "name": name, "secret": secret})
 
-# ─── Webhook HTTP endpoint ──────────────────────────
+# ─── HTTP endpoints ─────────────────────────────────
 from starlette.requests import Request as StarletteRequest
-from starlette.responses import JSONResponse
-from fastapi.responses import StreamingResponse
-from fastapi import Request, HTTPException
+from starlette.responses import JSONResponse, StreamingResponse
 
 async def webhook_handler(request: StarletteRequest):
     """Handle incoming webhook POST requests."""
@@ -1125,7 +1141,7 @@ async def webhook_handler(request: StarletteRequest):
     return JSONResponse({"task_id": task_id, "status": "pending"})
 
 # ─── SSE streaming endpoint ───────────────────────────
-async def stream_task_handler(request: Request):
+async def stream_task_handler(request: StarletteRequest):
     """SSE stream for task steps. GET /stream/{task_id}"""
     task_id = request.path_params.get("task_id", "")
 
@@ -1183,6 +1199,8 @@ async def stream_task_handler(request: Request):
         headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
     )
 
+
+
 # ─── Scheduler setup ────────────────────────────────
 scheduler = AsyncIOScheduler()
 
@@ -1212,25 +1230,109 @@ def load_schedules():
         _register_cron_job(s["id"], s["cron"], s["prompt"])
     log.info(f"[SCHEDULE] Loaded {len(schedules)} schedules")
 
+# ─── REST task API endpoints ─────────────────────────
+# POST /tasks  — create & enqueue a task
+# POST /run    — alias for POST /tasks (OpenSquid compat)
+# GET  /tasks  — list tasks
+# GET  /sessions — alias for GET /tasks
+# GET  /tasks/{id}  — get task + steps
+# GET  /status/{id} — alias for GET /tasks/{id}
+# DELETE /tasks/{id} — cancel a task
+
+def _check_bearer(request: StarletteRequest):
+    auth = request.headers.get("Authorization", "")
+    return auth == f"Bearer {AUTH_TOKEN}"
+
+async def http_task_create(request: StarletteRequest):
+    """POST /tasks or POST /run — create and enqueue a task."""
+    if not _check_bearer(request):
+        return JSONResponse({"error": "Unauthorized"}, status_code=401)
+    try:
+        body = await request.json()
+    except Exception:
+        return JSONResponse({"error": "Invalid JSON"}, status_code=400)
+
+    # Accept 'goal' (dispatcher compat) as alias for 'prompt'
+    prompt = body.get("prompt") or body.get("goal", "")
+    if not prompt:
+        return JSONResponse({"error": "prompt or goal is required"}, status_code=400)
+    title = body.get("title") or prompt[:80]
+
+    # Map dispatcher 'arch' to daemon 'backend'
+    arch = body.get("arch", "")
+    backend = body.get("backend", "claude-code" if arch == "claude-code" else "api")
+
+    # Map 'skills' list to first skill name
+    skills_list = body.get("skills", [])
+    skill = body.get("skill") or body.get("skill_name") or (skills_list[0] if skills_list else None)
+
+    # Map 'agent_id' to isolated_cortex
+    agent_id = body.get("agent_id")
+    isolated_cortex = bool(body.get("isolated_cortex") or body.get("isolated_memory") or agent_id)
+
+    result = await daemon_task_create(
+        title=title, prompt=prompt,
+        backend=backend, skill=skill, isolated_cortex=isolated_cortex
+    )
+    data = json.loads(result)
+    data["session_id"] = data.get("task_id")  # OpenSquid compat alias
+    return JSONResponse(data, status_code=201)
+
+async def http_task_list(request: StarletteRequest):
+    """GET /tasks or GET /sessions — list tasks."""
+    if not _check_bearer(request):
+        return JSONResponse({"error": "Unauthorized"}, status_code=401)
+    limit = int(request.query_params.get("limit", 20))
+    result = await daemon_task_list(limit=limit)
+    return JSONResponse(json.loads(result))
+
+async def http_task_get(request: StarletteRequest):
+    """GET /tasks/{id} or GET /status/{id} — get task + steps."""
+    if not _check_bearer(request):
+        return JSONResponse({"error": "Unauthorized"}, status_code=401)
+    task_id = request.path_params.get("task_id", "")
+    result = await daemon_task_status(task_id)
+    data = json.loads(result)
+    if "error" in data:
+        return JSONResponse(data, status_code=404)
+    return JSONResponse(data)
+
+async def http_task_delete(request: StarletteRequest):
+    """DELETE /tasks/{id} — cancel a task."""
+    if not _check_bearer(request):
+        return JSONResponse({"error": "Unauthorized"}, status_code=401)
+    task_id = request.path_params.get("task_id", "")
+    result = await daemon_task_cancel(task_id)
+    data = json.loads(result)
+    if "error" in data:
+        return JSONResponse(data, status_code=404)
+    return JSONResponse(data)
+
 # ─── App startup ─────────────────────────────────────
 def create_app():
-    """Create the ASGI app with MCP + webhook + SSE stream routes."""
+    """Create the ASGI app with MCP + HTTP REST + webhook + SSE routes."""
     from starlette.applications import Starlette
     from starlette.routing import Route, Mount
 
     # Get the MCP ASGI app
     mcp_app = mcp.http_app(path="/mcp")
 
-    # Add webhook and stream routes
     routes = [
-        Route("/webhook/{webhook_id}", webhook_handler, methods=["POST"]),
-        Route("/stream/{task_id}", stream_task_handler, methods=["GET"]),
+        # Task REST API
+        Route("/tasks",           http_task_create,  methods=["POST"]),
+        Route("/tasks",           http_task_list,    methods=["GET"]),
+        Route("/tasks/{task_id}", http_task_get,     methods=["GET"]),
+        Route("/tasks/{task_id}", http_task_delete,  methods=["DELETE"]),
+        # OpenSquid compat aliases
+        Route("/run",             http_task_create,  methods=["POST"]),
+        Route("/sessions",        http_task_list,    methods=["GET"]),
+        Route("/status/{task_id}",http_task_get,     methods=["GET"]),
+        # Webhook + SSE
+        Route("/webhook/{webhook_id}", webhook_handler,   methods=["POST"]),
+        Route("/stream/{task_id}",     stream_task_handler, methods=["GET"]),
     ]
 
-    # Mount MCP app and add custom routes
     app = Starlette(routes=routes)
-
-    # Mount MCP at root so /mcp works
     app.mount("/", mcp_app)
 
     return app

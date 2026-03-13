@@ -2,7 +2,7 @@
 # Setup script for daemon-server
 set -e
 
-cd ~/claude/parity/daemon
+cd ~/claude/opensquid/daemon
 
 # Create virtual environment
 python3 -m venv venv
@@ -15,6 +15,7 @@ pip install \
     anthropic \
     httpx \
     apscheduler \
-    uvicorn
+    uvicorn \
+    starlette
 
-echo "Setup complete. Activate with: source ~/claude/parity/daemon/venv/bin/activate"
+echo "Setup complete. Run kick-off.sh to start daemon."
