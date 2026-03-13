@@ -6,7 +6,7 @@ FastMCP server with Claude Opus agentic loop, heartbeat scheduler,
 task/schedule/webhook management.
 
 Run:  python3 daemon-server.py
-Port: 8254
+Port: 8256
 """
 
 import os, json, uuid, logging, asyncio, sqlite3, datetime, secrets, socket, subprocess
@@ -281,6 +281,8 @@ def init_db():
             title TEXT NOT NULL,
             prompt TEXT NOT NULL,
             status TEXT NOT NULL DEFAULT 'pending',
+            backend TEXT NOT NULL DEFAULT 'api',
+            skill TEXT,
             created_at TEXT NOT NULL,
             updated_at TEXT NOT NULL,
             result TEXT
@@ -309,6 +311,14 @@ def init_db():
             last_triggered TEXT
         );
     """)
+    # Migrations: add backend/skill columns to existing DBs
+    for col, defn in [("backend", "TEXT NOT NULL DEFAULT 'api'"), ("skill", "TEXT")]:
+        try:
+            db.execute(f"ALTER TABLE tasks ADD COLUMN {col} {defn}")
+            db.commit()
+            log.info(f"[DB] Migrated tasks: added column {col}")
+        except Exception:
+            pass  # column already exists
     db.close()
     log.info(f"Database initialized at {DB_PATH}")
 
@@ -947,8 +957,8 @@ async def daemon_task_create(
     now = datetime.datetime.utcnow().isoformat()
     db = get_db()
     db.execute(
-        "INSERT INTO tasks (id, title, prompt, status, created_at, updated_at) VALUES (?,?,?,?,?,?)",
-        (task_id, title, prompt, "pending", now, now)
+        "INSERT INTO tasks (id, title, prompt, status, backend, skill, created_at, updated_at) VALUES (?,?,?,?,?,?,?,?)",
+        (task_id, title, prompt, "pending", backend, skill, now, now)
     )
     db.commit()
     db.close()
@@ -991,6 +1001,8 @@ async def daemon_task_status(task_id: str) -> str:
         "id": task["id"],
         "title": task["title"],
         "status": task["status"],
+        "backend": task["backend"] if "backend" in task.keys() else "api",
+        "skill": task["skill"] if "skill" in task.keys() else None,
         "created_at": task["created_at"],
         "updated_at": task["updated_at"],
         "result": task["result"],

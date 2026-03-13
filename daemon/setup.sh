@@ -4,8 +4,9 @@ set -e
 
 cd ~/claude/opensquid/daemon
 
-# Create virtual environment
-python3 -m venv venv
+# Create virtual environment (use miniconda Python 3.12)
+PYTHON=/home/jfischer/miniconda3/envs/agent/bin/python3
+$PYTHON -m venv venv
 source venv/bin/activate
 
 # Install dependencies

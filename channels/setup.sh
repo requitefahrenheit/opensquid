@@ -2,10 +2,11 @@
 # Setup script for channels-server
 set -e
 
-cd ~/claude/parity/channels
+cd ~/claude/opensquid/channels
 
-# Create virtual environment
-python3 -m venv venv
+# Create virtual environment (use miniconda Python 3.12)
+PYTHON=/home/jfischer/miniconda3/envs/agent/bin/python3
+$PYTHON -m venv venv
 source venv/bin/activate
 
 # Install dependencies
@@ -17,4 +18,4 @@ pip install \
     uvicorn \
     starlette
 
-echo "Setup complete. Activate with: source ~/claude/parity/channels/venv/bin/activate"
+echo "Setup complete. Activate with: source ~/claude/opensquid/channels/venv/bin/activate"

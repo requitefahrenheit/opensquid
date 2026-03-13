@@ -2,7 +2,7 @@
 # Setup script for voice-wake daemon
 set -e
 
-cd ~/claude/parity/voice-wake
+cd ~/claude/opensquid/voice-wake
 
 # Create virtual environment
 python3 -m venv venv
@@ -17,4 +17,4 @@ pip install \
     python-dotenv \
     numpy
 
-echo "Setup complete. Activate with: source ~/claude/parity/voice-wake/venv/bin/activate"
+echo "Setup complete. Activate with: source ~/claude/opensquid/voice-wake/venv/bin/activate"
