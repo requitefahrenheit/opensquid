@@ -10,18 +10,24 @@ Runs on **c-jfischer3** (Irvine, CA). All services bind `127.0.0.1`; external ac
 
 ```
 opensquid/
-  daemon-server.py      # Primary service — agentic loop + HTTP API + MCP tools
-  agent_cortex.py       # Per-task isolated Cortex manager (reference copy)
-  channels-server.py    # Telegram bot gateway
-  browser-server.py     # httpx + BeautifulSoup4 web fetcher (MCP)
+  daemon/
+    daemon-server.py    # Primary service — agentic loop + HTTP API + MCP tools
+    daemon.db           # Live SQLite task database
+    SOUL.md             # System prompt / identity
+    HEARTBEAT.md        # Directives read every 30 min by APScheduler
+    kick-off.sh         # Start daemon
+    setup.sh            # Create daemon venv
+  channels/
+    channels-server.py  # Telegram bot gateway
+    kick-off.sh / setup.sh
+  browser/
+    browser-server.py   # httpx + BeautifulSoup4 web fetcher (MCP)
+    kick-off.sh / setup.sh
   voice-wake/           # pvporcupine wake word daemon (stub)
   skills/               # Skill libraries (SKILL.md files)
-  SOUL.md               # System prompt / identity for the daemon
-  HEARTBEAT.md          # Directives read every 30 min by APScheduler
-  daemon.db             # Live SQLite task database
-  kick-off.sh           # Kill old processes → start all services
-  start.sh              # Foreground start (debug use)
-  setup.sh              # Create venv + install deps
+  agent_cortex.py       # Per-task isolated Cortex manager (reference copy)
+  kick-off.sh           # Kill old processes → start daemon + browser
+  setup.sh              # Root setup (channels + browser deps)
   .env.example          # Env var template for channels-server
 ```
 
@@ -31,10 +37,10 @@ opensquid/
 
 | Service       | Port  | File                  | Notes                         |
 |---------------|-------|-----------------------|-------------------------------|
-| daemon        | 8256  | daemon-server.py      | Primary service, always on    |
-| channels      | 8257  | channels-server.py    | Requires TELEGRAM_BOT_TOKEN   |
-| browser       | 8258  | browser-server.py     | httpx+bs4, no Playwright      |
-| agent-cortex  | 8300–8399 | (dynamic)         | Per-task isolated Cortex DBs  |
+| daemon        | 8256  | daemon/daemon-server.py   | Primary service, always on    |
+| channels      | 8257  | channels/channels-server.py | Requires TELEGRAM_BOT_TOKEN |
+| browser       | 8258  | browser/browser-server.py | httpx+bs4, no Playwright    |
+| agent-cortex  | 8300–8399 | (dynamic)             | Per-task isolated Cortex DBs  |
 
 Upstream dependencies (not managed here):
 - Cortex autonomous: port 8082 / `https://autonomous.fahrenheitrequited.dev`
@@ -181,7 +187,7 @@ Never use `?token=` query params.
 
 ## Database
 
-SQLite WAL mode at `~/claude/opensquid/daemon.db`.
+SQLite WAL mode at `~/claude/opensquid/daemon/daemon.db`.
 
 Schema: `tasks`, `task_steps`, `schedules`, `webhooks`
 
