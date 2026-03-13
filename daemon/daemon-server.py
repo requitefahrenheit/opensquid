@@ -46,7 +46,8 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(name)s] %(message
 
 _CORTEX_DIR = Path.home() / "cortex"
 _DUAL_SERVER = Path.home() / "claude" / "mcp-server" / "dual-server.py"
-_PYTHON = Path.home() / "miniconda3" / "bin" / "python3"
+_PYTHON = Path(os.environ.get("OPENSQUID_CORTEX_PYTHON",
+    str(Path.home() / "miniconda3" / "bin" / "python3")))
 _CORTEX_PORT_RANGE = range(8300, 8400)
 _CORTEX_HEALTH_TIMEOUT = 180.0  # seconds; ML model loading can take 2+ minutes
 
@@ -383,14 +384,16 @@ def run_session_claude_code(
     mcp_servers: dict of {name: {url: ..., type: "http"}}
     Returns: (stdout, stderr, returncode)
     """
-    cli = "/home/jfischer/.npm-global/bin/claude"
+    cli = os.environ.get("OPENSQUID_CLAUDE_CLI",
+        str(Path.home() / ".npm-global" / "bin" / "claude"))
     env = os.environ.copy()
     env.pop("CLAUDECODE", None)  # allow nested sessions
     if "/usr/local/bin" not in env.get("PATH", ""):
         env["PATH"] = "/usr/local/bin:" + env.get("PATH", "")
 
     # Ensure node is on PATH (claude CLI requires it)
-    node_paths = ["/usr/local/bin", "/usr/bin", "/home/jfischer/.npm-global/bin"]
+    extra_node = os.environ.get("OPENSQUID_NODE_PATHS", "/usr/local/bin:/usr/bin")
+    node_paths = extra_node.split(":") + [str(Path.home() / ".npm-global" / "bin")]
     existing_path = env.get("PATH", "")
     extra = ":".join(p for p in node_paths if p not in existing_path)
     if extra:

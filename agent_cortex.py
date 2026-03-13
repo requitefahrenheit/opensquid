@@ -20,7 +20,8 @@ from pathlib import Path
 
 CORTEX_DIR = Path.home() / "cortex"
 DUAL_SERVER = Path.home() / "claude" / "mcp-server" / "dual-server.py"
-PYTHON = Path.home() / "miniconda3" / "bin" / "python3"
+PYTHON = Path(os.environ.get("OPENSQUID_CORTEX_PYTHON",
+    str(Path.home() / "miniconda3" / "bin" / "python3")))
 PORT_RANGE = range(8300, 8400)
 HEALTH_TIMEOUT = 180.0  # seconds; ML model loading can take 2+ minutes
 
